@@ -1,5 +1,7 @@
 # Ansible Role: Keepalived
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
 An Ansible role to install and configure Keepalived for high availability (HA) virtual IP (VIP) management across Linux distributions.
 
 ## Overview
