@@ -1,0 +1,70 @@
+## Managed by ANSIBLE
+#
+# To view keepalive logs run:
+#   journalctl -u keepalived
+#
+
+{% for kh in keepalived_health %}
+vrrp_script {{ kh.name }} {
+   script "{{ kh.script }}"
+   timeout  {{ kh.timeout }} 
+   interval {{ kh.interval }}
+}
+{% endfor %}
+
+{% for instance in keepalived_vrrp_instances %}
+
+vrrp_instance {{ instance.name }} {
+   state {{ instance.state }} # MASTER/BACKUP
+{% if ( instance.ipv6 | default(false) ) %}
+   native_ipv6
+{% endif %}
+{% if not ( instance.ipv6 | default(false) ) %}
+{% for interface in ansible_interfaces %}
+{% if interface.startswith('eth') and ( instance.unicast_src_ip | default(ansible_host) ) in ( ( hostvars[inventory_hostname]['ansible_' + interface].ipv4_secondaries | default([], true) + [ hostvars[inventory_hostname]['ansible_' + interface].ipv4 | default({}, true) ] ) | selectattr('address','defined') | map(attribute='address') | list ) %}
+   interface {{ interface }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if ( instance.ipv6 | default(false) ) %}
+   interface {% for interface in ansible_interfaces %}{% if interface.startswith('eth') and hostvars[inventory_hostname]['ansible_' + interface].ipv6 is defined and ( instance.unicast_src_ip | default(ansible_host) ) in hostvars[inventory_hostname]['ansible_' + interface].ipv6 | map(attribute='address') | list %}{{ interface }}{% endif %}{% endfor %}
+{% endif %}
+
+   virtual_router_id {{ instance.id }}
+   # Can be the same on both instances,
+   # unless using MASTER/BACKUP then the bigger number is for the master,
+   # although the effective priority will be  limited  to  the range [1,254].
+   priority {{ instance.priority }}
+   advert_int 4
+
+   authentication {
+    auth_type PASS
+    auth_pass {{ instance.pass }}
+   }
+
+   # Unicast specific option, this is the IP of the interface keepalived listens on
+   unicast_src_ip {{ instance.unicast_src_ip | default(ansible_host) }}{{ '' if not ( instance.ipv6 | default(false) ) else '/64' }}
+
+   # Unicast specific option, this is the IP of the peer instance
+   unicast_peer {
+    {{ instance.peer_ip if instance.peer_ip is defined else '' }}
+{% if instance.peers_ips is defined %}
+{% for peer_ip in instance.peers_ips %}
+    {{ peer_ip }}
+{% endfor %}
+{% endif %}
+   }
+
+   track_script {
+    {{ instance.track_script }}
+   }
+
+   # The virtual ip address shared between the two loadbalancers
+   virtual_ipaddress {
+{% for vip in instance.virtual_ip %}
+    {{ vip }}
+{% endfor %}
+   }
+}
+
+{% endfor %}

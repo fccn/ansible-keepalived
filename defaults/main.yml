@@ -1,0 +1,27 @@
+---
+
+keepalived_packages:
+  - "keepalived"
+
+keepalived_health:
+  name: chk_script
+  script: "service docker start"
+  interval: 2
+  timeout: 3
+
+keepalived_connected_network_interface: "{% for interface in ansible_interfaces %}{% if interface.startswith('eth') and hostvars[inventory_hostname]['ansible_' + interface]['ipv4']['address'] == ansible_host %}{{ interface }}{% endif %}{% endfor %}"
+
+# Required variable, not defined because it is required to be defined to put keepalived weel configured.
+# Also with it comment by default it is possible to run the role only if this variable is defined.
+# keepalived_vrrp_instances:
+#   - name: failover_link
+#     ipv6: false
+#     state: MASTER
+#     check_if: eth1
+#     id: 51
+#     priority: 200
+#     pass: password
+#     peer_ip: "CHANGEME"
+#     track_script: chk_script
+#     virtual_ip: 
+#       - "CHANGEME"

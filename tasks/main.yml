@@ -1,0 +1,24 @@
+---
+- name: Install keepalived packages
+  package:
+    name: "{{ keepalived_packages }}"
+    state: present
+  tags: keepalived
+
+- name: Adding keepalived configuration template
+  template:
+    dest: "/etc/keepalived/keepalived.conf"
+    src: "keepalived.conf.j2"
+  tags: keepalived
+  register: keepalived_conf_out
+
+# Apply directly if not we would need a flush handler
+# but the flush handler could make other role handlers be executed immediately
+- name: Restart keepalived if configuration has changed
+  service: 
+    name : keepalived
+    enabled: yes
+    state: restarted
+  tags: keepalived
+  when: keepalived_conf_out.changed or ( keepalived_service_force_restart | default (false) | bool )
+  ignore_errors: "{{ ansible_check_mode }}"
