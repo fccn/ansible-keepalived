@@ -1,0 +1,34 @@
+---
+galaxy_info:
+  author: FCCN
+  description: An Ansible role to install and configure Keepalived for high availability (HA) virtual IP (VIP) management across Linux distributions.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.9"
+  
+  platforms:
+    - name: Ubuntu
+      versions:
+        - focal
+        - jammy
+        - noble
+    - name: Debian
+      versions:
+        - bullseye
+        - bookworm
+    - name: EL
+      versions:
+        - "7"
+        - "8"
+        - "9"
+  
+  galaxy_tags:
+    - keepalived
+    - vrrp
+    - highavailability
+    - ha
+    - vip
+    - loadbalancing
+    - networking
+    - failover
+
+dependencies: []
