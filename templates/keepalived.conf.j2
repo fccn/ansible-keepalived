@@ -54,11 +54,11 @@ vrrp_instance {{ instance.name }} {
 {% endfor %}
 {% endif %}
    }
-
+{% if instance.track_script is defined %}
    track_script {
     {{ instance.track_script }}
    }
-
+{% endif %}
    # The virtual ip address shared between the two loadbalancers
    virtual_ipaddress {
 {% for vip in instance.virtual_ip %}
