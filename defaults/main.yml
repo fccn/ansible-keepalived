@@ -1,13 +1,12 @@
 ---
-
 keepalived_packages:
   - "keepalived"
 
 keepalived_health:
-  name: chk_script
-  script: "service docker start"
-  interval: 2
-  timeout: 3
+  - name: chk_script
+    script: "service docker start"
+    interval: 2
+    timeout: 3
 
 keepalived_connected_network_interface: "{% for interface in ansible_interfaces %}{% if interface.startswith('eth') and hostvars[inventory_hostname]['ansible_' + interface]['ipv4']['address'] == ansible_host %}{{ interface }}{% endif %}{% endfor %}"
 
@@ -23,5 +22,5 @@ keepalived_connected_network_interface: "{% for interface in ansible_interfaces 
 #     pass: password
 #     peer_ip: "CHANGEME"
 #     track_script: chk_script
-#     virtual_ip: 
+#     virtual_ip:
 #       - "CHANGEME"
