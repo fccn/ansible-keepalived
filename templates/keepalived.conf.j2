@@ -19,15 +19,23 @@ vrrp_instance {{ instance.name }} {
 {% if ( instance.ipv6 | default(false) ) %}
    native_ipv6
 {% endif %}
+{#- Interface is resolved by matching unicast_src_ip (or ansible_host) against each interface's
+   actual bound address -- naming-scheme-agnostic by construction, works for any NIC name
+   (eth0, ensX, enpXsY, ...). Never reintroduce a name-prefix assumption (e.g. startswith('eth'))
+   here, that's what silently broke on hosts using predictable network interface naming. #}
+{% if instance.interface is defined %}
+   interface {{ instance.interface }}
+{% else %}
 {% if not ( instance.ipv6 | default(false) ) %}
 {% for interface in ansible_interfaces %}
-{% if interface.startswith('eth') and ( instance.unicast_src_ip | default(ansible_host) ) in ( ( hostvars[inventory_hostname]['ansible_' + interface].ipv4_secondaries | default([], true) + [ hostvars[inventory_hostname]['ansible_' + interface].ipv4 | default({}, true) ] ) | selectattr('address','defined') | map(attribute='address') | list ) %}
+{% if ( instance.unicast_src_ip | default(ansible_host) ) in ( ( hostvars[inventory_hostname]['ansible_' + interface].ipv4_secondaries | default([], true) + [ hostvars[inventory_hostname]['ansible_' + interface].ipv4 | default({}, true) ] ) | selectattr('address','defined') | map(attribute='address') | list ) %}
    interface {{ interface }}
 {% endif %}
 {% endfor %}
 {% endif %}
 {% if ( instance.ipv6 | default(false) ) %}
-   interface {% for interface in ansible_interfaces %}{% if interface.startswith('eth') and hostvars[inventory_hostname]['ansible_' + interface].ipv6 is defined and ( instance.unicast_src_ip | default(ansible_host) ) in hostvars[inventory_hostname]['ansible_' + interface].ipv6 | map(attribute='address') | list %}{{ interface }}{% endif %}{% endfor %}
+   interface {% for interface in ansible_interfaces %}{% if hostvars[inventory_hostname]['ansible_' + interface].ipv6 is defined and ( instance.unicast_src_ip | default(ansible_host) ) in hostvars[inventory_hostname]['ansible_' + interface].ipv6 | map(attribute='address') | list %}{{ interface }}{% endif %}{% endfor %}
+{% endif %}
 {% endif %}
 
    virtual_router_id {{ instance.id }}

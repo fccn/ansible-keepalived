@@ -31,7 +31,11 @@ This pattern can be used on an active-passive layout or also more complicated fo
 
 ### Required Variables
 
-- `keepalived_vrrp_instances` - List of VRRP instance configurations (see examples below)
+- `keepalived_vrrp_instances` - List of VRRP instance configurations (see examples below). Each
+  `virtual_ip` entry's `dev <interface>` clause is optional -- per keepalived's own behavior, a VIP
+  with no `dev` is added to the vrrp_instance's own (auto-detected) interface, so it generally
+  doesn't need to be specified at all; only set it if a specific VIP must live on a different NIC
+  than the one VRRP itself uses.
 
 ### Default Variables
 
@@ -39,7 +43,15 @@ See [defaults/main.yml](defaults/main.yml) for all available variables:
 
 - `keepalived_packages` - Package list to install (default: `["keepalived"]`)
 - `keepalived_health` - Health check script configuration
-- `keepalived_connected_network_interface` - Auto-detected network interface
+- `keepalived_connected_network_interface` - Kept for backward compatibility only. Each
+  `vrrp_instance`'s interface is now auto-detected internally by the role (matching
+  `unicast_src_ip`, or `ansible_host` if unset, against each interface's actual bound address), so
+  it works no matter how the OS/hypervisor names the NIC (`eth0`, `ensX`, `enpXsY`, ...) and no
+  matter how many NICs a host has. Set `interface:` on an individual `keepalived_vrrp_instances`
+  entry to override this for that instance. **Never hardcode an interface name** (e.g. `eth0`/`eth1`)
+  in a consuming playbook's `virtual_ip`/`interface` values -- that reintroduces the exact bug this
+  auto-detection exists to avoid, and silently breaks the next time a host's NIC gets renamed by a
+  migration.
 - `keepalived_priority_override` - Temporary priority override for rolling deploys 
 
 ## Usage
@@ -104,7 +116,7 @@ redis_keepalived_vrrp_instances:
     peer_ip: "{{ redis_keepalived_peer_ipv4 }}"
     track_script: redis_chk_script
     virtual_ip:
-      - "{{ redis_virtual_ipv4 }}/24 dev {{ keepalived_connected_network_interface }} label vipRedis"
+      - "{{ redis_virtual_ipv4 }}/24 label vipRedis"
 
 redis_keepalived_health:
   - name: redis_chk_script
@@ -143,6 +155,9 @@ balancer_virtual_ipv6_2: "2001:690:a00:4001::183"
 # Keepalived VRRP Instances (4 VIPs: 2 IPv4 + 2 IPv6)
 # VIP1 is MASTER on node 1, BACKUP on node 2
 # VIP2 is MASTER on node 2, BACKUP on node 1
+# Dual-NIC example: each instance sets unicast_src_ip to the public IP, so the role resolves
+# `interface` to the public NIC automatically (matching that IP), regardless of which NIC has the
+# host's default route, and regardless of what either NIC is named.
 balancer_keepalived_vrrp_instances:
   - name: failover_link_ipv4_1
     ipv6: false
@@ -154,7 +169,7 @@ balancer_keepalived_vrrp_instances:
     unicast_src_ip: "{{ ansible_public_ipv4 }}"
     track_script: chk_script
     virtual_ip:
-      - "{{ balancer_virtual_ipv4_1 }}/24 dev eth0 label vipLB1"
+      - "{{ balancer_virtual_ipv4_1 }}/24 label vipLB1"
       
   - name: failover_link_ipv6_1
     ipv6: true
@@ -166,7 +181,7 @@ balancer_keepalived_vrrp_instances:
     unicast_src_ip: "{{ ansible_public_ipv6 }}"
     track_script: chk_script
     virtual_ip:
-      - "{{ balancer_virtual_ipv6_1 }}/64 dev eth0 label vipLB1"
+      - "{{ balancer_virtual_ipv6_1 }}/64 label vipLB1"
 
   - name: failover_link_ipv4_2
     ipv6: false
@@ -178,7 +193,7 @@ balancer_keepalived_vrrp_instances:
     unicast_src_ip: "{{ ansible_public_ipv4 }}"
     track_script: chk_script
     virtual_ip:
-      - "{{ balancer_virtual_ipv4_2 }}/24 dev eth0 label vipLB2"
+      - "{{ balancer_virtual_ipv4_2 }}/24 label vipLB2"
       
   - name: failover_link_ipv6_2
     ipv6: true
@@ -190,7 +205,7 @@ balancer_keepalived_vrrp_instances:
     unicast_src_ip: "{{ ansible_public_ipv6 }}"
     track_script: chk_script
     virtual_ip:
-      - "{{ balancer_virtual_ipv6_2 }}/64 dev eth0 label vipLB2"
+      - "{{ balancer_virtual_ipv6_2 }}/64 label vipLB2"
 
 # State and Priority Logic
 balancer_keepalived_state_1: "{{ 'MASTER' if ( groups['balancer_servers'][0] == inventory_hostname ) else 'BACKUP' }}"
