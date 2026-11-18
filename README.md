@@ -53,6 +53,63 @@ See [defaults/main.yml](defaults/main.yml) for all available variables:
   auto-detection exists to avoid, and silently breaks the next time a host's NIC gets renamed by a
   migration.
 - `keepalived_priority_override` - Temporary priority override for rolling deploys 
+- `keepalived_global_defs` - Options of keepalived's `global_defs` block, as `option: value`
+  (default: `{}`, keepalived's own defaults). See [Gratuitous ARP](#gratuitous-arp).
+- `keepalived_vip_guard` - Drop the traffic that reaches a node for a VIP held by another node
+  (default: `false`). See [Gratuitous ARP](#gratuitous-arp).
+- `keepalived_service_force_restart` - Restart keepalived even if its configuration did not change
+  (default: `false`). A changed configuration is applied with a reload, see
+  [Applying a configuration change](#applying-a-configuration-change).
+
+### Gratuitous ARP
+
+When a BACKUP takes a VIP, for example because the adverts of the MASTER were lost during a network
+problem, it sends gratuitous ARP and the clients learn its MAC for the VIP. When the MASTER wins the
+VIP back without having left the MASTER state, keepalived does not send gratuitous ARP by default, so
+a client can keep sending the VIP's traffic to the other node. If that node still answers the
+connections it had open (for example through Docker's NAT), the client's ARP entry stays confirmed
+and never expires.
+
+These options of `keepalived_global_defs` make the MASTER announce the VIP again:
+
+```yaml
+keepalived_global_defs:
+  vrrp_garp_master_refresh: 60          # every 60 s while MASTER
+  vrrp_garp_master_refresh_repeat: 2
+  vrrp_garp_lower_prio_repeat: 5        # when a MASTER receives an advert with a lower priority
+  vrrp_higher_prio_send_advert: true    # when a MASTER steps down, so the other MASTER sends them
+```
+
+They exist in keepalived 2.0 and later.
+
+`keepalived_vip_guard: true` also stops the old node from confirming the wrong ARP entry. It
+installs `/usr/local/sbin/keepalived-vip-guard`, which adds one rule per IPv4 VIP of the node and
+interface of the VIP's network, in the `raw` table, before Docker's NAT:
+
+```
+-A PREROUTING -d <VIP>/32 -i <interface> -m addrtype ! --dst-type LOCAL -m comment --comment keepalived-vip-guard -j DROP
+```
+
+- `addrtype ! --dst-type LOCAL` is checked for each packet, so the rule never matches while the node
+  holds the VIP, and needs no change when the VIP moves.
+- `-i` limits it to the traffic from the network, so local containers can still reach a VIP held by
+  another node.
+- A client that sends the VIP's traffic to this node gets no answer, its ARP entry expires, and it
+  finds the node that holds the VIP, in about a minute with the kernel's defaults.
+
+The script runs before keepalived starts (systemd drop-in `keepalived.service.d/vip-guard.conf`),
+so the rules come back after a reboot, and the role runs it again when the VIPs change or the rules
+are missing. `keepalived-vip-guard --check` exits with 1 when the rules are not the current ones.
+The `filter` table rules of a firewall role are not touched. To remove it, delete the drop-in and
+the script, run `systemctl daemon-reload`, and delete the rules with the `keepalived-vip-guard`
+comment from the `raw` table.
+
+### Applying a configuration change
+
+A changed configuration is applied with a reload, which keeps each node's state. A restart would
+remove the VIPs of the MASTER, a BACKUP would take them, and the MASTER would take them back when it
+starts: each VIP would move twice. Lowering the priority with `keepalived_priority_override` still
+moves the VIP once, because the BACKUP takes it when it receives the lower priority advert.
 
 ## Usage
 

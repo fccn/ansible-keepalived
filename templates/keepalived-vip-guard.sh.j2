@@ -1,0 +1,75 @@
+#!/bin/sh
+# {{ ansible_managed | default('Managed by Ansible') }} (ansible-keepalived, keepalived_vip_guard)
+#
+# Drops the traffic that reaches this host for a keepalived VIP that this host does not hold.
+#
+# After a VIP moves to another node, a client can keep this host's MAC for it. If this host still
+# answers the connections it had open (Docker's NAT keeps forwarding them to the container), the
+# client's ARP entry stays confirmed and never expires, so its new connections keep failing.
+# Dropping that traffic lets the client's ARP entry expire and find the node that holds the VIP.
+#
+# One rule per VIP and interface, in the raw table, before Docker's NAT. The interfaces are the one
+# keepalived adds the VIP to, and the ones with a connected route to the VIP's network, since a
+# host with more than one interface on that network can answer ARP for the VIP with any of them:
+#   -i <interface> -d <VIP> -m addrtype ! --dst-type LOCAL -j DROP
+# `addrtype ! --dst-type LOCAL` is checked for each packet, so the rule never matches while this
+# host holds the VIP. `-i` keeps the traffic of local containers to a VIP held by another node.
+#
+# Usage: keepalived-vip-guard          replaces the rules with the current ones
+#        keepalived-vip-guard --check  exits 1 when the rules are not the current ones
+set -eu
+set -f
+
+COMMENT="keepalived-vip-guard"
+{# Same interface detection as keepalived.conf.j2: the instance's interface, else the one with
+    unicast_src_ip (or ansible_host), unless the VIP has its own `dev`. #}
+{% set ns = namespace(vips='') %}
+{% for instance in keepalived_vrrp_instances if not ( instance.ipv6 | default(false) ) %}
+{% set dev = namespace(name=instance.interface | default('')) %}
+{% if not dev.name %}
+{% for interface in ansible_interfaces %}
+{% if ( instance.unicast_src_ip | default(ansible_host) ) in ( ( hostvars[inventory_hostname]['ansible_' + interface].ipv4_secondaries | default([], true) + [ hostvars[inventory_hostname]['ansible_' + interface].ipv4 | default({}, true) ] ) | selectattr('address','defined') | map(attribute='address') | list ) %}
+{% set dev.name = interface %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% for vip in instance.virtual_ip %}
+{% set parts = vip.split() %}
+{% set address = parts[0].split('/')[0] %}
+{% if ':' not in address %}
+{% set ns.vips = ns.vips ~ ' ' ~ address ~ ':' ~ ( parts[parts.index('dev') + 1] if 'dev' in parts else dev.name ) %}
+{% endif %}
+{% endfor %}
+{% endfor %}
+# <VIP>:<interface keepalived adds it to>
+VIPS="{{ ns.vips | trim }}"
+
+command -v iptables >/dev/null 2>&1 || { echo "iptables not found, nothing to do"; exit 0; }
+
+wanted() {
+  for entry in $VIPS; do
+    vip=${entry%%:*}
+    devs=$( { [ -z "${entry#*:}" ] || echo "${entry#*:}"; ip -o -4 route show match "$vip" | awk '/ scope link / { for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1) }'; } | sort -u)
+    [ -n "$devs" ] || echo "no interface for $vip, no rule for it" >&2
+    for dev in $devs; do
+      echo "-A PREROUTING -d $vip/32 -i $dev -m addrtype ! --dst-type LOCAL -m comment --comment $COMMENT -j DROP"
+    done
+  done
+}
+
+current() {
+  iptables -t raw -S PREROUTING | grep -- "--comment $COMMENT " || true
+}
+
+if [ "${1:-}" = "--check" ]; then
+  [ "$(wanted | sort)" = "$(current | sort)" ]
+  exit $?
+fi
+
+current | sed 's/^-A /-D /' | while read -r rule; do
+  iptables -t raw $rule
+done
+wanted | while read -r rule; do
+  iptables -t raw $rule
+  echo "added: $rule"
+done
