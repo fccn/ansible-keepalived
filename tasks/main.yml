@@ -13,12 +13,16 @@
   register: keepalived_conf_out
 
 # Apply directly if not we would need a flush handler
-# but the flush handler could make other role handlers be executed immediately
-- name: Restart keepalived if configuration has changed
-  service: 
+# but the flush handler could make other role handlers be executed immediately.
+# Reload, not restart: restarting the MASTER removes its VIPs, a BACKUP takes them and the MASTER
+# takes them back when it starts, so a configuration change would move each VIP twice. A reload
+# keeps the state, and a lower priority still moves the VIP once. A service that is not running
+# is started. keepalived_service_force_restart still restarts.
+- name: Reload keepalived if configuration has changed
+  service:
     name : keepalived
     enabled: yes
-    state: restarted
+    state: "{{ 'restarted' if ( keepalived_service_force_restart | default(false) | bool ) else 'reloaded' }}"
   tags: keepalived
   when: keepalived_conf_out.changed or ( keepalived_service_force_restart | default (false) | bool )
   ignore_errors: "{{ ansible_check_mode }}"

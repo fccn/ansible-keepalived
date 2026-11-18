@@ -4,6 +4,14 @@
 #   journalctl -u keepalived
 #
 
+{% if keepalived_global_defs | default({}) | length > 0 %}
+global_defs {
+{% for key, value in keepalived_global_defs.items() %}
+   {{ key }} {{ (value | string | lower) if value is boolean else value }}
+{% endfor %}
+}
+
+{% endif %}
 {% for kh in keepalived_health %}
 vrrp_script {{ kh.name }} {
    script "{{ kh.script }}"
