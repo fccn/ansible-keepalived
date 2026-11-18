@@ -12,6 +12,55 @@
   tags: keepalived
   register: keepalived_conf_out
 
+- name: Install the script that drops the traffic for VIPs held by another node
+  template:
+    src: keepalived-vip-guard.sh.j2
+    dest: /usr/local/sbin/keepalived-vip-guard
+    mode: "0755"
+  tags: keepalived
+  register: keepalived_vip_guard_script
+  when: keepalived_vip_guard | bool
+
+- name: Create the directory of the keepalived systemd drop-ins
+  file:
+    path: /etc/systemd/system/keepalived.service.d
+    state: directory
+    mode: "0755"
+  tags: keepalived
+  when: keepalived_vip_guard | bool
+
+- name: Run that script before keepalived starts, so the rules come back after a reboot
+  copy:
+    dest: /etc/systemd/system/keepalived.service.d/vip-guard.conf
+    content: |
+      # Managed by Ansible (ansible-keepalived, keepalived_vip_guard)
+      [Service]
+      ExecStartPre=/usr/local/sbin/keepalived-vip-guard
+    mode: "0644"
+  tags: keepalived
+  register: keepalived_vip_guard_dropin
+  when: keepalived_vip_guard | bool
+
+- name: Reload systemd after changing the keepalived drop-in
+  systemd:
+    daemon_reload: true
+  tags: keepalived
+  when: keepalived_vip_guard | bool and keepalived_vip_guard_dropin.changed
+
+- name: Check the rules that drop the traffic for VIPs held by another node
+  command: /usr/local/sbin/keepalived-vip-guard --check
+  tags: keepalived
+  register: keepalived_vip_guard_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: keepalived_vip_guard | bool and not ( ansible_check_mode and keepalived_vip_guard_script.changed )
+
+- name: Apply the rules that drop the traffic for VIPs held by another node
+  command: /usr/local/sbin/keepalived-vip-guard
+  tags: keepalived
+  when: keepalived_vip_guard | bool and ( keepalived_vip_guard_script.changed or keepalived_vip_guard_check.rc | default(1) != 0 )
+
 # Apply directly if not we would need a flush handler
 # but the flush handler could make other role handlers be executed immediately.
 # Reload, not restart: restarting the MASTER removes its VIPs, a BACKUP takes them and the MASTER

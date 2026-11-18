@@ -55,6 +55,8 @@ See [defaults/main.yml](defaults/main.yml) for all available variables:
 - `keepalived_priority_override` - Temporary priority override for rolling deploys 
 - `keepalived_global_defs` - Options of keepalived's `global_defs` block, as `option: value`
   (default: `{}`, keepalived's own defaults). See [Gratuitous ARP](#gratuitous-arp).
+- `keepalived_vip_guard` - Drop the traffic that reaches a node for a VIP held by another node
+  (default: `false`). See [Gratuitous ARP](#gratuitous-arp).
 - `keepalived_service_force_restart` - Restart keepalived even if its configuration did not change
   (default: `false`). A changed configuration is applied with a reload, see
   [Applying a configuration change](#applying-a-configuration-change).
@@ -79,6 +81,28 @@ keepalived_global_defs:
 ```
 
 They exist in keepalived 2.0 and later.
+
+`keepalived_vip_guard: true` also stops the old node from confirming the wrong ARP entry. It
+installs `/usr/local/sbin/keepalived-vip-guard`, which adds one rule per IPv4 VIP of the node and
+interface of the VIP's network, in the `raw` table, before Docker's NAT:
+
+```
+-A PREROUTING -d <VIP>/32 -i <interface> -m addrtype ! --dst-type LOCAL -m comment --comment keepalived-vip-guard -j DROP
+```
+
+- `addrtype ! --dst-type LOCAL` is checked for each packet, so the rule never matches while the node
+  holds the VIP, and needs no change when the VIP moves.
+- `-i` limits it to the traffic from the network, so local containers can still reach a VIP held by
+  another node.
+- A client that sends the VIP's traffic to this node gets no answer, its ARP entry expires, and it
+  finds the node that holds the VIP, in about a minute with the kernel's defaults.
+
+The script runs before keepalived starts (systemd drop-in `keepalived.service.d/vip-guard.conf`),
+so the rules come back after a reboot, and the role runs it again when the VIPs change or the rules
+are missing. `keepalived-vip-guard --check` exits with 1 when the rules are not the current ones.
+The `filter` table rules of a firewall role are not touched. To remove it, delete the drop-in and
+the script, run `systemctl daemon-reload`, and delete the rules with the `keepalived-vip-guard`
+comment from the `raw` table.
 
 ### Applying a configuration change
 
