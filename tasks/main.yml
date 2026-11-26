@@ -1,4 +1,19 @@
 ---
+# keepalived_global_defs renders each value as text after the option, so a list or a dict would
+# render as Python syntax, which keepalived rejects; options that take several values need them
+# written as one string.
+- name: Check that keepalived_global_defs only has single values
+  assert:
+    that:
+      - keepalived_global_defs | default({}, true) is mapping
+      - keepalived_global_defs | default({}, true) | dict2items | map(attribute='value') | select('iterable') | reject('string') | list | length == 0
+    fail_msg: >-
+      keepalived_global_defs must be a dict of options with single values (text, number, true,
+      false or null). Write an option with several values as one string, for example
+      `notification_email: "a@example.org b@example.org"`.
+    quiet: true
+  tags: keepalived
+
 - name: Install keepalived packages
   package:
     name: "{{ keepalived_packages }}"
@@ -12,13 +27,118 @@
   tags: keepalived
   register: keepalived_conf_out
 
+- name: Install the script that drops the traffic for VIPs held by another node
+  template:
+    src: keepalived-vip-guard.sh.j2
+    dest: /usr/local/sbin/keepalived-vip-guard
+    mode: "0755"
+  tags: keepalived
+  register: keepalived_vip_guard_script
+  when: keepalived_vip_guard | bool
+
+- name: Create the directory of the keepalived systemd drop-ins
+  file:
+    path: /etc/systemd/system/keepalived.service.d
+    state: directory
+    mode: "0755"
+  tags: keepalived
+  when: keepalived_vip_guard | bool
+
+- name: Run that script before keepalived starts, so the rules come back after a reboot
+  copy:
+    dest: /etc/systemd/system/keepalived.service.d/vip-guard.conf
+    content: |
+      # Managed by Ansible (ansible-keepalived, keepalived_vip_guard)
+      # "-": keepalived starts even if the script fails, for example on a missing kernel module.
+      # timeout: it never waits for the xtables lock longer than the unit's start timeout.
+      [Service]
+      ExecStartPre=-/usr/bin/timeout 60 /usr/local/sbin/keepalived-vip-guard
+    mode: "0644"
+  tags: keepalived
+  register: keepalived_vip_guard_dropin
+  when: keepalived_vip_guard | bool
+
+- name: Reload systemd after changing the keepalived drop-in
+  systemd:
+    daemon_reload: true
+  tags: keepalived
+  when: keepalived_vip_guard | bool and keepalived_vip_guard_dropin.changed
+
+- name: Check the rules that drop the traffic for VIPs held by another node
+  command: /usr/local/sbin/keepalived-vip-guard --check
+  tags: keepalived
+  register: keepalived_vip_guard_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: keepalived_vip_guard | bool and not ( ansible_check_mode and keepalived_vip_guard_script.changed )
+
+- name: Apply the rules that drop the traffic for VIPs held by another node
+  command: /usr/local/sbin/keepalived-vip-guard
+  args:
+    # Without it, command skips itself in --check runs, which would not report missing rules.
+    removes: /usr/local/sbin/keepalived-vip-guard
+  tags: keepalived
+  when: keepalived_vip_guard | bool and ( keepalived_vip_guard_script.changed or keepalived_vip_guard_check.rc | default(1) != 0 )
+
+# keepalived_vip_guard turned off after it was on: remove the drop-in, the rules and the script.
+# The rules are deleted by their comment, not with the script, because an older script does not
+# know --remove. Nothing runs on hosts that never had the guard.
+- name: Remove the drop-in that runs the VIP guard
+  file:
+    path: /etc/systemd/system/keepalived.service.d/vip-guard.conf
+    state: absent
+  tags: keepalived
+  register: keepalived_vip_guard_dropin_removed
+  when: not ( keepalived_vip_guard | bool )
+
+- name: Reload systemd after removing the drop-in of the VIP guard
+  systemd:
+    daemon_reload: true
+  tags: keepalived
+  when: not ( keepalived_vip_guard | bool ) and keepalived_vip_guard_dropin_removed.changed
+
+- name: Delete the rules of the VIP guard
+  shell: |
+    for cmd in iptables ip6tables; do
+      command -v $cmd >/dev/null 2>&1 || continue
+      $cmd -w -t raw -S PREROUTING 2>/dev/null | grep -- '--comment keepalived-vip-guard ' | sed 's/^-A /-D /' | while read -r rule; do
+        $cmd -w -t raw $rule
+        echo "deleted: $rule"
+      done
+    done
+  args:
+    removes: /usr/local/sbin/keepalived-vip-guard
+  tags: keepalived
+  register: keepalived_vip_guard_rules_removed
+  changed_when: "'deleted: ' in keepalived_vip_guard_rules_removed.stdout | default('')"
+  when: not ( keepalived_vip_guard | bool )
+
+- name: Remove the script of the VIP guard
+  file:
+    path: /usr/local/sbin/keepalived-vip-guard
+    state: absent
+  tags: keepalived
+  when: not ( keepalived_vip_guard | bool )
+
 # Apply directly if not we would need a flush handler
-# but the flush handler could make other role handlers be executed immediately
-- name: Restart keepalived if configuration has changed
-  service: 
+# but the flush handler could make other role handlers be executed immediately.
+# Reload, not restart, for an ordinary change: restarting the MASTER removes its VIPs, a BACKUP
+# takes them and the MASTER takes them back when it starts, so the change would move each VIP
+# twice. A reload keeps each node's state. A service that is not running is started.
+# Restart when keepalived_priority_override is set: after a reload, a MASTER with a lowered
+# priority keeps its VIPs until the BACKUP's master down timer runs out (3 x advert_int + skew,
+# about 13 s), while a restart releases them at once (priority 0 advert), before the caller starts
+# the work that the lower priority is for. Restoring the priority (empty override) reloads.
+- name: Reload keepalived if configuration has changed
+  service:
     name : keepalived
     enabled: yes
-    state: restarted
+    state: "{{ 'restarted' if keepalived_restart | bool else 'reloaded' }}"
+  vars:
+    keepalived_restart: >-
+      {{ ( keepalived_service_force_restart | default(false) | bool )
+         or ( keepalived_priority_override | default('') | string | length > 0 ) }}
   tags: keepalived
   when: keepalived_conf_out.changed or ( keepalived_service_force_restart | default (false) | bool )
   ignore_errors: "{{ ansible_check_mode }}"

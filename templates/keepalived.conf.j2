@@ -4,6 +4,17 @@
 #   journalctl -u keepalived
 #
 
+{# true, null or "": the option alone, which turns it on; false: left out. Lists and dicts are
+   rejected by the role's first task. #}
+{% set global_defs = keepalived_global_defs | default({}, true) | dict2items | rejectattr('value', 'sameas', false) | list %}
+{% if global_defs | length > 0 %}
+global_defs {
+{% for option in global_defs %}
+   {{ option.key }}{{ '' if option.value is none or option.value is sameas true or option.value | string == '' else ' ' ~ option.value }}
+{% endfor %}
+}
+
+{% endif %}
 {% for kh in keepalived_health %}
 vrrp_script {{ kh.name }} {
    script "{{ kh.script }}"
