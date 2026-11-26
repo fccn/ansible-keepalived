@@ -53,6 +53,133 @@ See [defaults/main.yml](defaults/main.yml) for all available variables:
   auto-detection exists to avoid, and silently breaks the next time a host's NIC gets renamed by a
   migration.
 - `keepalived_priority_override` - Temporary priority override for rolling deploys 
+- `keepalived_global_defs` - Options of keepalived's `global_defs` block, as `option: value`
+  (default: `{}`, keepalived's own defaults). Each value must be a single value:
+  - `true`, `null` or `""` writes the option alone, which turns it on;
+  - `false` leaves it out;
+  - text and numbers are written as they are, so the string `"false"` is written as `false`, which
+    turns on an option that takes no value (e.g. `vrrp_strict`). Use the boolean `false` instead;
+  - an option with several values is written as one string. A list or a dict fails the role's
+    first task.
+
+  See [Gratuitous ARP](#gratuitous-arp).
+- `keepalived_vip_guard` - Drop the traffic that reaches a node for a VIP held by another node
+  (default: `false`). Setting it back to `false` removes it. See [Gratuitous ARP](#gratuitous-arp).
+- `keepalived_service_force_restart` - Restart keepalived even if its configuration did not change
+  (default: `false`). See [Applying a configuration change](#applying-a-configuration-change).
+
+### Gratuitous ARP
+
+When a BACKUP takes a VIP, for example because the adverts of the MASTER were lost during a network
+problem, it sends gratuitous ARP and the clients learn its MAC for the VIP. What happens when the
+network comes back depends on which adverts were lost:
+
+- **Only the MASTER's adverts lost** (the MASTER still hears the BACKUP): the MASTER receives the
+  BACKUP's lower priority adverts and sends gratuitous ARP for its VIPs (`vrrp_garp_lower_prio_repeat`,
+  which defaults to `vrrp_garp_master_repeat`, 5). The clients learn its MAC again.
+- **Adverts lost in both directions**: the MASTER never hears the BACKUP. When the network comes
+  back, the BACKUP hears the MASTER and steps down without sending anything, and the MASTER never
+  left the MASTER state, so nothing announces the VIP again. A client keeps sending the VIP's
+  traffic to the BACKUP. If the BACKUP still answers the connections it had open (for example
+  through Docker's NAT), the client's ARP entry stays confirmed and never expires, so its new
+  connections fail until someone deletes the entry.
+
+These options of `keepalived_global_defs` cover the second case. They exist in keepalived 2.0 and
+later:
+
+```yaml
+keepalived_global_defs:
+  vrrp_higher_prio_send_advert: true    # when a MASTER steps down, so the other MASTER announces
+  vrrp_garp_master_refresh: 60          # every 60 s while MASTER
+  vrrp_garp_master_refresh_repeat: 2
+```
+
+- **`vrrp_higher_prio_send_advert`** is the event-driven fix. The BACKUP sends one last advert when
+  it steps down, and the MASTER answers it with gratuitous ARP, so the clients are back within a
+  few seconds. If that last advert is lost too, for example because the network comes back in one
+  direction before the other, nothing is sent.
+- **`vrrp_garp_master_refresh`** is the safety net. It bounds every case to the interval. During a
+  period with two MASTERs, the higher priority one pulls the clients back every interval, which
+  resets their connections that were open through the other node.
+- `vrrp_garp_lower_prio_repeat` does nothing alone: it only changes how many gratuitous ARP are
+  sent when the MASTER hears a lower priority advert, which it already does by default.
+- `true` is written as the option alone, which turns it on.
+
+Measured in a lab with keepalived 2.0.19 and 2.2.4, a client whose connection was open through the
+BACKUP (time until its new connections reach the MASTER again):
+
+| Settings | Adverts lost in both directions, network back at once | Same, but the BACKUP's last advert lost |
+|---|---|---|
+| none (keepalived's defaults) | never | never |
+| `vrrp_higher_prio_send_advert` | 3 s | never |
+| `vrrp_garp_master_refresh: 60` | 23 s | 32 s |
+| `vrrp_garp_lower_prio_repeat: 5` | never | never |
+| `keepalived_vip_guard: true` | 36–42 s | 32–39 s |
+| `vrrp_higher_prio_send_advert`, `vrrp_garp_master_refresh: 60` and the guard | 2–3 s | 5–48 s |
+
+With only the MASTER's adverts lost, the defaults recover in under a second. When only the refresh
+and the guard can help, the time depends on when the next refresh falls, so it varies from run to
+run; a shorter `vrrp_garp_master_refresh` lowers the bound.
+
+`keepalived_vip_guard: true` also stops the old node from confirming the wrong ARP entry. It
+installs `/usr/local/sbin/keepalived-vip-guard`, which adds one rule per VIP of the node and
+interface, in the `raw` table, before Docker's NAT, with `iptables` for IPv4 VIPs and `ip6tables`
+for IPv6 VIPs:
+
+```
+-A PREROUTING -d <IPv4 VIP>/32 -i <interface> -m addrtype ! --dst-type LOCAL -m comment --comment keepalived-vip-guard -j DROP
+-A PREROUTING -d <IPv6 VIP>/128 -i <interface> -m addrtype ! --dst-type LOCAL -m comment --comment keepalived-vip-guard -j DROP
+```
+
+The interfaces are the one keepalived adds the VIP to (detected like in `keepalived.conf`), and the
+ones with a connected route to the VIP's network, since a node with more than one interface on that
+network can answer ARP or NDP for the VIP with any of them. Default routes are not used.
+
+- `addrtype ! --dst-type LOCAL` is checked for each packet, so the rule never matches while the node
+  holds the VIP, and needs no change when the VIP moves.
+- `-i` limits it to the traffic from the network, so local containers can still reach a VIP held by
+  another node.
+- A client that sends the VIP's traffic to this node gets no answer, its ARP entry expires, and it
+  finds the node that holds the VIP, in about a minute at most with the kernel's defaults.
+- It drops rather than rejects, so this node sends nothing back for the VIP. The cost: the
+  connections that were still open through this node are not reset, so their clients wait for
+  their own timeouts (TCP retransmissions, or the application's) before they reconnect.
+
+The script runs before keepalived starts (systemd drop-in `keepalived.service.d/vip-guard.conf`),
+so the rules come back after a reboot, and the role runs it again when the VIPs change or the rules
+are missing.
+
+- **It never stops keepalived from starting.** The drop-in ignores a failure of the script
+  (`ExecStartPre=-`) and gives it at most 60 s. The script waits for the xtables lock (`iptables -w`),
+  which dockerd can hold while both start at boot.
+- `keepalived-vip-guard --check` exits with 1 when the rules are not the current ones (it compares
+  them with `iptables -C`, so an IPv6 VIP does not have to be written in canonical form), and
+  `keepalived-vip-guard --remove` deletes them.
+- The `filter` table rules of a firewall role are not touched.
+- Setting `keepalived_vip_guard` back to `false` removes the drop-in, the rules and the script.
+
+### Applying a configuration change
+
+A changed configuration is applied with a reload, which keeps each node's state. A restart would
+remove the VIPs of the MASTER, a BACKUP would take them, and the MASTER would take them back when it
+starts: each VIP would move twice.
+
+A reload only applies what keepalived reads again on reload. The options of
+[Gratuitous ARP](#gratuitous-arp) and the VRRP instances, scripts and VIPs take effect on a reload
+(tested with keepalived 2.0.19 and 2.2.4). An option that keepalived only reads when it starts needs
+`keepalived_service_force_restart: true`, which moves each VIP twice.
+
+When `keepalived_priority_override` is set, the role restarts keepalived instead:
+
+- **Lowering the priority restarts.** A reloaded MASTER with a lower priority keeps its VIPs until
+  the BACKUP's master down timer runs out (3 × `advert_int` + skew, about 13 s with `advert_int 4`),
+  because a BACKUP ignores lower priority adverts. A restart releases the VIPs at once: keepalived
+  sends a priority 0 advert when it stops, the BACKUP takes them right away, and the node comes back
+  with the lower priority. So the VIPs have left the node when the role returns, before the work the
+  lower priority is for begins.
+- **Restoring the priority** (`keepalived_priority_override: ""`) reloads. The node takes its VIPs
+  back when the other node's adverts time out, about 13 s later.
+- `keepalived_service_force_restart: true` always restarts.
 
 ## Usage
 

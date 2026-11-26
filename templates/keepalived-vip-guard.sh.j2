@@ -1,0 +1,117 @@
+#!/bin/sh
+# {{ ansible_managed | default('Managed by Ansible') }} (ansible-keepalived, keepalived_vip_guard)
+#
+# Drops the traffic that reaches this host for a keepalived VIP that this host does not hold.
+#
+# After a VIP moves to another node, a client can keep this host's MAC for it. If this host still
+# answers the connections it had open (Docker's NAT keeps forwarding them to the container), the
+# client's ARP entry stays confirmed and never expires, so its new connections keep failing.
+# Dropping that traffic lets the client's ARP entry expire and find the node that holds the VIP.
+#
+# One rule per VIP and interface, in the raw table, before Docker's NAT. The interfaces are the one
+# keepalived adds the VIP to, and the ones with a connected route to the VIP's network, since a
+# host with more than one interface on that network can answer ARP or NDP for the VIP with any of
+# them (default routes are not used):
+#   -i <interface> -d <VIP> -m addrtype ! --dst-type LOCAL -j DROP
+# `addrtype ! --dst-type LOCAL` is checked for each packet, so the rule never matches while this
+# host holds the VIP. `-i` keeps the traffic of local containers to a VIP held by another node.
+# IPv4 VIPs use iptables and IPv6 VIPs ip6tables.
+#
+# It waits for the xtables lock (-w), since dockerd can hold it while it starts. keepalived's
+# systemd drop-in ignores a failure of this script, so it never stops keepalived from starting.
+#
+# Usage: keepalived-vip-guard          replaces the rules with the current ones
+#        keepalived-vip-guard --check  exits 1 when the rules are not the current ones
+#        keepalived-vip-guard --remove removes the rules
+set -eu
+set -f
+
+COMMENT="keepalived-vip-guard"
+{# Same interface detection as keepalived.conf.j2: the instance's interface, else the one with
+    unicast_src_ip (or ansible_host), unless the VIP has its own `dev`. #}
+{% set ns = namespace(vips='') %}
+{% for instance in keepalived_vrrp_instances %}
+{% set family = 'ipv6' if ( instance.ipv6 | default(false) ) else 'ipv4' %}
+{% set dev = namespace(name=instance.interface | default('')) %}
+{% if not dev.name %}
+{% for interface in ansible_interfaces %}
+{% set facts = hostvars[inventory_hostname]['ansible_' + interface] | default({}) %}
+{% if family == 'ipv4' %}
+{% set addresses = ( facts.ipv4_secondaries | default([], true) + [ facts.ipv4 | default({}, true) ] ) | selectattr('address', 'defined') | map(attribute='address') | list %}
+{% else %}
+{% set addresses = facts.ipv6 | default([], true) | selectattr('address', 'defined') | map(attribute='address') | list %}
+{% endif %}
+{% if ( instance.unicast_src_ip | default(ansible_host) ) in addresses %}
+{% set dev.name = interface %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% for vip in instance.virtual_ip %}
+{% set parts = vip.split() %}
+{% set ns.vips = ns.vips ~ ' ' ~ parts[0].split('/')[0] ~ '@' ~ ( parts[parts.index('dev') + 1] if 'dev' in parts else dev.name ) %}
+{% endfor %}
+{% endfor %}
+# <VIP>@<interface keepalived adds it to>
+VIPS="{{ ns.vips | trim }}"
+
+# <family> -> iptables command, empty when it is not installed
+ipt() {
+  case $1 in
+    4) cmd=iptables ;;
+    6) cmd=ip6tables ;;
+  esac
+  if command -v $cmd >/dev/null 2>&1; then echo "$cmd -w"; fi
+}
+
+# Prints "<family> <rule>" for each rule that should exist
+wanted() {
+  for entry in $VIPS; do
+    vip=${entry%@*}
+    case $vip in
+      *:*) family=6; prefix=128; routes=$(ip -o -6 route show match "$vip" | awk '$1 != "default" && $1 ~ /:/ && !/ via / { for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1) }') ;;
+      *) family=4; prefix=32; routes=$(ip -o -4 route show match "$vip" | awk '$1 != "default" && / scope link / { for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1) }') ;;
+    esac
+    [ -n "$(ipt $family)" ] || continue
+    devs=$( { [ -z "${entry#*@}" ] || echo "${entry#*@}"; [ -z "$routes" ] || echo "$routes"; } | sort -u)
+    [ -n "$devs" ] || echo "no interface for $vip, no rule for it" >&2
+    for dev in $devs; do
+      echo "$family -A PREROUTING -d $vip/$prefix -i $dev -m addrtype ! --dst-type LOCAL -m comment --comment $COMMENT -j DROP"
+    done
+  done
+}
+
+# Prints "<family> <rule>" for each rule of this script that exists. A raw table that cannot be
+# read (for example ip6tables-legacy without the ip6_tables module) has none.
+current() {
+  for family in 4 6; do
+    cmd=$(ipt $family)
+    [ -n "$cmd" ] || continue
+    $cmd -t raw -S PREROUTING 2>/dev/null | grep -- "--comment $COMMENT " | sed "s/^/$family /" || true
+  done
+}
+
+remove() {
+  current | sed 's/ -A / -D /' | while read -r family rule; do
+    $(ipt $family) -t raw $rule
+  done
+}
+
+case "${1:-}" in
+  --check)
+    # iptables -C parses the addresses, so an IPv6 VIP not written in canonical form (FD00:0:0::100)
+    # matches the rule that ip6tables -S prints (fd00::100); the counts catch extra rules.
+    [ "$(wanted | wc -l)" -eq "$(current | wc -l)" ] || exit 1
+    wanted | while read -r family rule; do
+      $(ipt $family) -t raw -C ${rule#-A } >/dev/null 2>&1 || exit 1
+    done
+    exit $? ;;
+  --remove)
+    remove
+    exit 0 ;;
+esac
+
+remove
+wanted | while read -r family rule; do
+  $(ipt $family) -t raw $rule
+  echo "added: $rule"
+done
